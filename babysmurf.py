@@ -1,11 +1,12 @@
 import numpy as np
 import numpy.matlib
 import matplotlib.pyplot as plt
+import scipy.signal
 
 def make_measured_signal(tvec,sig,squid,noise=None,reset_rate=1.e4,nphi0=4,fsamp=2.4e6):
    """
-   Take the detector signal and produce a modulated resonator frequency. 
-   This does not yet include resonator frequency estimation effects from SMuRF. 
+   Take the detector signal and produce a modulated resonance frequency. 
+   This is only the bottom of the resonance!
 
    Args:
    tvec: time vector of signal. units = seconds
@@ -76,6 +77,29 @@ def make_squid_curve(lda,amp,npts=600):
 
    return squid
 
+def make_s21_measurement(fvec,resfreq,q,qc):
+   """
+   Make an S21 vs time matrix given the resonator S21 and its resonance frequency movement vs time. 
+   No resonator/SQUID physics here! This just perturbs the S21 back and forth to the resonance frequency. 
+
+   Args: 
+   fvec: frequency points at which response is sampled, units = Hz
+   resfreq: resonance frequency vs time, doesn't actually matter the sample rate
+   q: quality factor, unitless
+   qc: coupling quality factor, unitless, allowed to be complex to allow for asymmetry
+
+   Returns:
+   s21matrixmag, s21matrixphase: complex resonator response vs time, for passing into 
+   """
+
+   s21matrixmag = np.zeros((len(fvec),len(resfreq)))
+   s21matrixphase = np.zeros((len(fvec),len(resfreq)))
+
+   for ii in np.arange(len(resfreq)): # is there a way to vectorize this?
+      s21matrixmag[:,ii],s21matrixphase[:,ii] = make_res_s21(resfreq[ii],fvec,q,qc)
+
+   return s21matrixmag,s21matrixphase
+   
 
 def add_noise(sig,noise_spec,fsamp=2.4e6):
    """
@@ -98,11 +122,14 @@ def add_noise(sig,noise_spec,fsamp=2.4e6):
    noisy_sig = noise + sig
    return noisy_sig 
 
-def lms_fit_demod(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsamp=2.4e6,nharm=3):
+def lms_fit_demod_track(respmag,respphase,fvec,eta,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsamp=2.4e6,nharm=3):
    """
-   The main SMuRF demodulation loop. Currently assumes "measurement" is perfect estimate of resonator frequency. 
+   The main SMuRF demodulation loop. Assumes that you started tracking perfectly, ie that the probe tone begins at the bottom of the resonance dip. 
+
    Args:
-   measurement: the measured signal, in (nframes * fsamp / reset_rate) x 1. Unit = Hz
+   resp:* the resonator (complex) S21 vs time. This is what the resonator is ACTUALLY doing at each timestep sampled at fsamp. (nframes*fsamp/reset_rate x length(fvec), where nframes = Delta(t) in seconds * reset_rate). 
+   fvec: frequencies at which the resonator response above is sampled. 
+   eta: eta calibration to apply for this resonance. A complex number, from estimate_eta
    reset_rate: flux ramp sawtooth reset rate. Units = Hz, defaults 10kHz
    nphi0: number of phi0 per flux ramp, unitless, defaults 4
    gain: feedback gain parameter, unitless, defaults 1/32. I need to figure out the normalization on this thing. 
@@ -115,6 +142,81 @@ def lms_fit_demod(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsa
    demod_sig: (nframes x 1), sampled at the reset rate. The demodulated phase of the first harmonic, units = radians
    phases: (length(measurement) x nharm), sampled at fsamp. The phases of each harmonic estimate in real time, units = radians
    # do I want to return yhat?
+   errs: (same size as measurement), sampled at fsamp rate. The errors between the tracked frequency and estimate, units = Hz. 
+   """
+   framesize = int(fsamp / reset_rate) # number of time samples per flux ramp frame
+   nframes = int(np.shape(respmag)[0] // framesize) # number of full flux ramp frames in the real timestream
+
+   H = make_obs_mat(reset_rate,nphi0,fsamp,nharm) # construct observation coefficient matrix
+
+   alpha = np.ones((2*nharm+1,)) # initialize coefficient vector alpha
+   yhat = np.zeros((framesize*nframes,1)) # initialize frequency estimate vector yhat
+   # estimate will start at center frequency of first timestep
+   alphas = np.zeros((framesize*nframes,2*nharm+1))
+   phases = np.zeros((framesize*nframes,nharm)) # initialize phase estimates of harmonics
+   errs = np.zeros((framesize*nframes,1)) # initialize measurement vector, this is the frequency errors that we are trying to minimize
+
+   for ii in range(framesize*nframes):
+      blankmin = np.round(framesize*blank[0]) # get where in frame to start
+      blankmax = np.round(framesize*blank[1]) # ...and where to stop
+
+      rowno = np.mod(ii+framesize,framesize) # figure out where in the frame we are
+      h = H[rowno,:] # get the harmonic components of this frame
+      yhat[ii] = np.matmul(h,alpha) # estimate is based on existing alpha
+      # this is SMuRF paper Eqs. 13 and 14
+
+      if ii==0:
+         # estimate will start at center frequency of first timestep
+         # yhat[ii] =  estimate_res_freq(fvec,respmag[0,:],respphase[0,:])[0] # pass through method arg later
+         yhat[ii] = 0 # does this work better if everything goes into constant?
+
+      centerfreq = estimate_res_freq(fvec,respmag[0,:],respphase[0,:])[0]
+      probetone = (centerfreq - yhat[ii])[0]
+      actualfreq = estimate_res_freq(fvec,respmag[ii,:],respphase[ii,:])[0]
+      # estimate the frequency error
+      errs[ii] = estimate_freq_error(fvec,respmag[ii,:],respphase[ii,:],eta,probetone)
+ 
+      #print(f"actual resonator frequency:{actualfreq*1e-6}MHz")
+      #print(f"probe tone:{probetone*1e-6}MHz")
+      #print(f"estimated frequency error:{errs[ii]} Hz")
+      #print(f"actual frequency error:{actualfreq - probetone}")
+      #print(f"")
+      if np.logical_or(rowno < blankmin, rowno > blankmax):
+         alpha = alpha # in the blankoff region, do not update the coefficients
+      else:
+         # update the coefficients for the next point (SMuRF paper eq. 16)
+         alpha = alpha + gain*errs[ii]*np.transpose(h) / (np.sum(np.power(h,2))) # h^2 is a normalization factor
+
+      # save the coefficients for inspection
+      alphas[ii,:] = alpha
+      # save the phase estimate for each harmonic
+      for jj in range(nharm):
+         phases[ii,jj] = np.arctan2(alpha[2*jj+1],alpha[jj])
+
+   demod = get_frame_averages(phases[:,0],reset_rate,fsamp)
+   # demod = 0
+
+   return demod, phases, yhat, errs, alphas 
+
+
+def lms_fit_demod_meas(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsamp=2.4e6,nharm=3):
+   """
+   The main SMuRF demodulation loop. This assumes "measurement" is perfect estimate of resonator frequency. 
+   Args:
+   measurement: the measured signal, in (nframes * fsamp / reset_rate) x 1, ie sampled at fsamp. Unit = Hz
+   reset_rate: flux ramp sawtooth reset rate. Units = Hz, defaults 10kHz
+   nphi0: number of phi0 per flux ramp, unitless, defaults 4
+   gain: feedback gain parameter, unitless, defaults 1/32. I need to figure out the normalization on this thing. 
+   blank: start and end fractions of the flux ramp frame to use for phase estimation. unitless, defaults [0,1]
+   fsamp: sample rate, units = Hz, defaults 2.4MHz
+   nharm: number of harmonics to use in estimation, defaults 3. Currently SMuRF supports nharm <= 3; future iterations could use more.
+
+
+   Returns:
+   demod_sig: (nframes x 1), sampled at the reset rate. The demodulated phase of the first harmonic, units = radians
+   phases: (length(measurement) x nharm), sampled at fsamp. The phases of each harmonic estimate in real time, units = radians
+   # do I want to return yhat?
+   yhat: sampled at fsamp rate, the tracked frequency ie where the tone is
    errs: (same size as measurement), sampled at fsamp rate. The errors between the tracked frequency and estimate, units = Hz. 
    """
    framesize = int(fsamp / reset_rate) # number of time samples per flux ramp frame
@@ -137,11 +239,12 @@ def lms_fit_demod(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsa
       yhat[ii] = np.matmul(h,alpha) # estimate is based on existing alpha
       # this is SMuRF paper Eqs. 13 and 14
 
+      # get the error
+      errs[ii] = measurement[ii] - yhat[ii]
+ 
       if np.logical_or(rowno < blankmin, rowno > blankmax):
          alpha = alpha # in the blankoff region, do not update the coefficients
       else:
-         # get the error
-         errs[ii] = measurement[ii] - yhat[ii]
          # update the coefficients for the next point (SMuRF paper eq. 16)
          alpha = alpha + gain*errs[ii]*np.transpose(h) / (np.sum(np.power(h,2))) # h^2 is a normalization factor
 
@@ -151,7 +254,7 @@ def lms_fit_demod(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsa
 
    demod = get_frame_averages(phases[:,0],reset_rate,fsamp)
 
-   return demod, phases, errs 
+   return demod, phases, yhat, errs 
 
 def make_obs_mat(reset_rate=10.e3,nphi0=4,fsamp=2.4e6,nharm=3):
    """
@@ -215,30 +318,38 @@ def filter_and_downsample(sig,filt,fsamp_new=200.,fr_rate=10.e3):
    Returns:
    new_sig: filtered and downsampled signal, this is probably what is written to disk
    """
-   new_sig = sig
+   b = filt[0]
+   a = filt[1]
+   filtered = scipy.signal.filtfilt(b,a,sig)
+   # figure out how smurf implements the downstreamer????
+   downsample_factor = fr_rate / fsamp_new # factor by which to downsample
    return new_sig
 
-def make_res_s21(f0,deltaf,q,asym=0,npts=100):
+def make_res_s21(f0,fvec,q,qc):
    """
    Make a resonator S21 (amplitude, phase) to interact with. 
    Note that this resonator is not guaranteed to be physical. 
 
    Args:
    f0: center frequency, units = Hz
-   deltaf: bandwidth, units = Hz
+   fvec: frequency points at which to sample the response, units = Hz
+   # width: +/- range of frequencies to produce response for, units = Hz. 
    q: quality factor, unitless
-   asym: asymmetry, for probing effects of the asymmetry, unitless, defaults 0
-   npts: number of points to return, defaults 100 (~1kHz sampling for a 100kHz wide resonator)
+   qc: coupling quality factor, unitless, allowed to be complex to allow for asymmetry
+   # asym: asymmetry, for probing effects of the asymmetry, unitless, defaults 0
 
-   Returns (all npts x 1):
-   fvec:  frequency points
+   Returns (all len(fvec) x 1):
    amp: S21 amplitude
    ph: S21 phase
    """
+   # fvec = np.linspace(f0-width,f0+width,npts)
+   s21 = (1 - (q * qc**-1 / (1 + 2j * q * (fvec - f0) / f0)))
+   amp = np.abs(s21)
+   ph = np.angle(s21)
 
-   return fvec,amp,ph
+   return amp,ph
 
-def estimate_eta(fvec,res_s21,offset=30.e3):
+def estimate_eta(fvec,res_s21mag,res_s21phase,offset=30.e3,method='dphase'):
    """
    Estimate eta calibration angle per Eq. 3 of the SMuRF paper. 
    This estimation is critical to the SMuRF estimate of frequency!!!
@@ -246,25 +357,87 @@ def estimate_eta(fvec,res_s21,offset=30.e3):
 
    Args:
    fvec: frequency points the S21 is sampled at, units=Hz
-   res_s21: complex transmission (decide if I want this...)
-   f0: center frequency, units=Hz
+   res_s21*: complex transmission magnitude and phase, same size as fvec
    offset: offset from center at which to sample eta, units=Hz, defaults 30kHz
+   method: passed to estimate_res_freq to get the resonance frequency
 
    Returns:
-   eta_mag,eta_phase: complex coefficients by which to rotate and scale resonator circle to perform frequency error estimates
+   eta: complex coefficients by which to rotate and scale resonator circle to perform frequency error estimates. eta_phase is in radians!
    """
 
-   return eta_mag,eta_phase
+   # get the bottom of the resonance, which is not guaranteed to be the same as the center frequency used to construct it if asymmetric
+   f0,f0idx = estimate_res_freq(fvec,res_s21mag,res_s21phase,method)
 
-def estimate_frequency(fvec,res_s21,eta,probe_f):
+   # then find the +/- offset points
+   fpidx = np.where(np.abs(fvec-(f0+offset)) == np.min(np.abs(fvec-(f0+offset))))[0][0]
+   fnidx = np.where(np.abs(fvec-(f0-offset)) == np.min(np.abs(fvec-(f0-offset))))[0][0]
+
+   fpts = fvec[np.asarray([fnidx,f0idx,fpidx])]
+   magpts = res_s21mag[np.asarray([fnidx,f0idx,fpidx])]
+   phasepts = res_s21phase[np.asarray([fnidx,f0idx,fpidx])]
+
+   # transform amp,phase into real,imaginary components
+   Ivec = res_s21mag * np.cos(res_s21phase)
+   Qvec = res_s21mag * np.sin(res_s21phase)
+
+   # need to fix smurf paper, I/Q in smurf are flipped by 90 degrees relative to resonator I/Q
+   eta = (2*offset) / np.complex(Qvec[fpidx]-Qvec[fnidx],Ivec[fpidx]-Ivec[fnidx])
+   return eta
+
+def estimate_res_freq(fvec,res_s21mag,res_s21phase,method='dphase'):
+   """
+   Estimate the resonance frequency given a frequency vector and S21 response. 
+   More asymmetric resonances may be highly sensitive to the estimation method. 
+
+   Args:
+   fvec: frequency vector at which the S21 response is sampled, units = Hz
+   res_21*: complex resonator transmission response, split into magnitude and phase, same size as fvec
+   method: method of estimation. Currently supported:
+     'ddmag': get the point of largest magnitude second derivative
+     'dphase (Default)': get the point of maximum phase slip
+     'minmag': get the point of minimum magnitude
+     < will add more later >
+
+   Returns:
+   f0: resonance center frequency, units = Hz
+   """
+
+   mag = res_s21mag
+   phase = res_s21phase
+
+   if method=='ddmag':
+      idx = np.where(np.diff(np.diff(mag)) == np.max(np.diff(np.diff(mag))))[0][0] + 1 # many derivatives offsets by 1 relative to main vector
+
+   elif method=='dphase':
+      idx = np.where(np.diff(phase)==np.max(np.diff(phase)))[0][0] 
+
+   elif method=='minmag':
+      idx = np.where(mag == np.min(mag))[0][0]
+
+   else:
+      raise ValueError("Estimation type not supported!")
+
+   return fvec[idx],idx
+
+def estimate_freq_error(fvec,res_s21mag,res_s21phase,eta,probe_f):
    """
    Estimate frequency error per Eq. 4 of the SMuRF paper. 
    Assume that the fvec,res_s21 are the TRUE state of the resonance
 
    Args:
    fvec: frequency points the S21 is sampled at, units=Hz
-   res_s21: complex transmission
+   res_s21*: complex transmission magnitude and phase, same size as fvec
    eta: calibration factor, as estimated from estimate_eta
    probe_f: frequency of the resonator probe tone, units=Hz. Currently assuming a perfectly spectrally clean probe tone. 
+
+   Returns:
+   fhat: estimate of the frequency shift, units = Hz
    """
-   return fhat
+
+   # get the complex transmission at that probe index
+   s21 = res_s21mag * np.exp(1j*res_s21phase)
+   trans = np.matlib.interp([probe_f],fvec,s21)[0]
+
+   return np.imag(trans * eta)
+
+
