@@ -212,6 +212,76 @@ def lms_fit_demod_track(respmag,respphase,fvec,eta,reset_rate=10.e3,nphi0=4,gain
 
    return demod, phases, yhat, errs, alphas 
 
+def lms_fit_demod_untrack(respmag,respphase,fvec,eta,reset_rate=10.e3,nphi0=4,gain=1/32,fsamp=2.4e6,nharm=3):
+   """
+   Same as above, lms_fit_demod_untrack, but the probe tone doesn't move....
+
+   Args:
+   resp:* the resonator (complex) S21 vs time. This is what the resonator is ACTUALLY doing at each timestep sampled at fsamp. (nframes*fsamp/reset_rate x length(fvec), where nframes = Delta(t) in seconds * reset_rate). 
+   fvec: frequencies at which the resonator response above is sampled. 
+   eta: eta calibration to apply for this resonance. A complex number, from estimate_eta
+   reset_rate: flux ramp sawtooth reset rate. Units = Hz, defaults 10kHz
+   nphi0: number of phi0 per flux ramp, unitless, defaults 4
+   gain: feedback gain parameter, unitless, defaults 1/32. I need to figure out how to map this onto lms_gain in pysmurf.
+   NO BLANK OFF: this function is essentially the same as setting the blank-off to [0,0]  or something I guess
+
+   fsamp: sample rate, units = Hz, defaults 2.4MHz
+   nharm: number of harmonics to use in estimation, defaults 3. Currently SMuRF supports nharm <= 3; future iterations could use more.
+
+
+   Returns:
+   demod_sig: (nframes x 1), sampled at the reset rate. The demodulated phase of the first harmonic, units = radians
+   phases: (length(measurement) x nharm), sampled at fsamp. The phases of each harmonic estimate in real time, units = radians
+   errs: (same size as measurement), sampled at fsamp rate. The errors between the (constant) probe tone and resonance frequency, estimated via eta, units = Hz. 
+   alphas: (length(measurement) x (2*nharm+1)), sampled at fsamp. The alpha coefficients at each timestep. 
+   """
+   framesize = int(fsamp / reset_rate) # number of time samples per flux ramp frame
+   nframes = int(np.shape(respmag)[0] // framesize) # number of full flux ramp frames in the real timestream
+
+   H = make_obs_mat(reset_rate,nphi0,fsamp,nharm) # construct observation coefficient matrix
+
+   alpha = np.ones((2*nharm+1,)) # initialize coefficient vector alpha
+   yhat = np.zeros((framesize*nframes,1)) # initialize frequency estimate vector yhat
+   # estimate will start at center frequency of first timestep
+   alphas = np.zeros((framesize*nframes,2*nharm+1))
+   phases = np.zeros((framesize*nframes,nharm)) # initialize phase estimates of harmonics
+   errs = np.zeros((framesize*nframes,1)) # initialize measurement vector, this is the frequency errors that we are trying to minimize
+
+   for ii in range(framesize*nframes):
+      rowno = np.mod(ii+framesize,framesize) # figure out where in the frame we are
+      h = H[rowno,:] # get the harmonic components of this frame
+      # this proceedings Eqs. 8 and 9.
+
+      if ii==0:
+      #if rowno==0:
+         yhat[ii] = 0 # initialize at the center of subband; this could be changed later.
+      else:
+         yhat[ii] = np.matmul(h,alpha) # estimate is based on existing alpha
+
+      centerfreq = estimate_res_freq(fvec,respmag[0,:],respphase[0,:])[0]
+      #probetone = (centerfreq - yhat[ii])[0]
+      probetone = centerfreq # keep this here at all times
+      actualfreq = estimate_res_freq(fvec,respmag[ii,:],respphase[ii,:])[0]
+      # estimate the frequency error
+      errs[ii] = estimate_freq_error(fvec,respmag[ii,:],respphase[ii,:],eta,probetone)
+        
+      # maybe do something like comparing errs to expectation?
+      expect = yhat[ii] - errs[ii]
+
+      alpha = alpha + gain*expect*np.transpose(h) / (np.sum(np.power(h,2))) # h^2 is a normalization factor
+    
+      # which we just save for inspection
+      alphas[ii,:] = alpha
+    
+      # save the phase estimate for each harmonic
+      for jj in range(nharm):
+         phases[ii,jj] = np.arctan2(alpha[2*jj+1],alpha[jj])
+
+      # do not actually update alpha, though--it grows out of control
+      alpha = np.ones((2*nharm+1,))
+   demod = get_frame_averages(np.unwrap(phases[:,0]),reset_rate,fsamp)
+
+   return demod, phases, errs, alphas 
 
 def lms_fit_demod_meas(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsamp=2.4e6,nharm=3):
    """
