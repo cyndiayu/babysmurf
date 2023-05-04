@@ -303,8 +303,8 @@ def lms_fit_demod_meas(measurement,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1
    errs: (same size as measurement), sampled at fsamp rate. The errors between the tracked frequency and estimate, units = Hz. 
    alphas: (length(measurement) x (2*nharm+1)), sampled at fsamp. The alpha coefficients at each timestep. 
    """
-   framesize = int(fsamp / reset_rate) # number of time samples per flux ramp frame
-   nframes = int(np.shape(measurement)[0] // framesize) # number of full flux ramp frames in the measurement
+   framesize = int(np.round(fsamp / reset_rate)) # number of time samples per flux ramp frame
+   nframes = int(np.round(np.shape(measurement)[0] / framesize)) # number of full flux ramp frames in the measurement
 
    H = make_obs_mat(reset_rate,nphi0,fsamp,nharm) # construct observation coefficient matrix
 
@@ -358,7 +358,7 @@ def make_obs_mat(reset_rate=10.e3,nphi0=4,fsamp=2.4e6,nharm=3):
    H: (M x 2N+1) matrix, where M is number of samples in a flux ramp frame (fsamp / reset_rate) and N is the number of harmonics used in the estimation. 
    """
    freqnorm = nphi0 * reset_rate / fsamp # normalized frequency, this is phi0 per sample
-   framesize = fsamp / reset_rate # number of time samples per flux ramp frame
+   framesize = int(np.round(fsamp / reset_rate)) # number of time samples per flux ramp frame
 
    H = np.zeros((int(framesize),2*nharm+1)) # construct observation matrix, per proceedings Eq. 6
    for ii in range(nharm):
@@ -382,7 +382,7 @@ def get_frame_averages(phase,reset_rate=10.e3,fsamp=2.4e6):
    avg: demodulated phase averaged over the flux ramp periods, so at the reset_rate. Still in units of radians. 
    """
    # do this by averaging method to avoid for loops
-   framesize = fsamp / reset_rate # number of samples per flux ramp frame
+   framesize = int(np.round(fsamp / reset_rate)) # number of samples per flux ramp frame
    nframes = len(phase)//framesize
    phase_reshaped = np.reshape(phase,(-1,int(nframes),int(framesize)))
    avg = np.transpose(np.sum(phase_reshaped,-1) / framesize)
