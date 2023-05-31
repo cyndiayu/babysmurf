@@ -129,19 +129,20 @@ def gen_noise_tod(noisespec,noisef,nsamp,fsamp=2.4e6):
 
    Args:
    noisespec: frequency noise psd, units Hz/rtHz
-   noisef: same size as noisespec; the frequency points at which the noise psd is sampled
+   noisef: same size as noisespec; the frequency points at which the noise psd is sampled.  Must include frequencies from 0 Hz all the way
+           to the Nyquist frequency or the input to the inverse FFT will be poorly interpolated!
    nsamp: number of samples to generate in the timestream
    fsamp: sample rate, defaults 2.4MHz
    
    Returns:
    tod: nsamp x 1
    """
-   ff = np.fft.rfftfreq(2*nsamp,d=1./fsamp) # generate full frequency array
-   speci = np.matlib.interp(ff,noisef,noisespec) # interpolate psd to correct shape
-   speci = speci * np.exp(np.random.rand(len(speci))*2*np.pi)
+   ff = np.fft.rfftfreq(n=nsamp,d=1./fsamp) # generate full frequency array
+   speci = npinterp(ff,noisef,noisespec) # interpolate psd to correct shape
+   speci = speci * np.exp(1j*np.random.rand(len(speci))*2*np.pi)
    speci[0] = np.real(speci[0]) # force DC term to be real
-   tod = np.fft.irfft(speci*(2*np.pi),n=2*nsamp,norm="ortho")
-   return scipy.signal.detrend(tod[10:nsamp+10]) # offset from the first few samples, which may ring
+   tod = np.fft.irfft(speci,n=nsamp,norm="forward") * np.sqrt(fsamp/(2*nsamp))
+   return tod
 
 def lms_fit_demod_track(respmag,respphase,fvec,eta,reset_rate=10.e3,nphi0=4,gain=1/32,blank=[0,1],fsamp=2.4e6,nharm=3):
    """
